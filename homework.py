@@ -2,19 +2,23 @@
 from http import HTTPStatus
 import logging
 import os
+import sys
 import time
 
 from dotenv import load_dotenv
 import requests
 from telebot import TeleBot
 
+
+class ServerAnswerException(Exception):
+    """Исключение на случай неожиданного ответа сервера."""
+
+    pass
+
+
 load_dotenv()
 
 logger = logging.getLogger(__name__)
-handlers = [
-    logging.StreamHandler(),
-    logging.FileHandler(filename=__file__ + '.log', encoding='utf-8')
-]
 
 PRACTICUM_TOKEN = os.getenv('PRACTICUM_TOKEN')
 TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
@@ -30,11 +34,13 @@ HOMEWORK_VERDICTS = {
     'rejected': 'Работа проверена: у ревьюера есть замечания.'
 }
 
-CHECK_TOKENS_ERROR = 'Отсутствует обязательная переменная окружения.'
+GLOBAL_TOKENS_ERROR = 'Отсутсвуют все необходимые переменные окружения.'
+DETAIL_TOKEN_ERROR = 'Отсутствует обязательная переменная окружения {}.'
 SEND_MESSAGE_SUCCESS = 'Бот отправил сообщение: {}'
-SEND_MESSAGE_ERROR = 'Ошибка при отправке сообщения: {}'
-API_ERROR = 'Ошибка при запросе к API. Параметры: {}, {}, {}'
-SERVER_ERROR = 'Отказ сервера. Параметры: {}, {}, {}. Ошибка: {}. Код: {}'
+SEND_MESSAGE_ERROR = 'Ошибка при отправке сообщения: {}. Ошибка: {}'
+CONNECTION_ERROR = 'Ошибка при запросе к API. Параметры: {}, {}, {}. Ошибка: {}'
+SERVER_FAILURE_ERROR = 'Отказ сервера. Параметры: {}, {}, {}. Ошибка: {}.'
+HTTP_ERROR = 'Код ответа сервера не OK. параметры: {}, {}, {}. Код: {}'
 DATA_TYPE_ERROR = 'Некорретный тип данных в ответе API: {}'
 NO_HOMEWORK_KEY_ERROR = 'Отсутвует ключ "homeworks" в словаре.'
 KEY_DATA_TYPE_ERROR = 'Некорректный тип данных под ключем "homeworks": {}'
@@ -46,11 +52,17 @@ STATUS_CHANGE_MESSAGE = 'Изменился статус проверки раб
 
 def check_tokens():
     """Проверяем наличие обязательных переменных окружения."""
-    tokens = (PRACTICUM_TOKEN, TELEGRAM_CHAT_ID, TELEGRAM_TOKEN)
+    tokens = {'PRACTICUM_TOKEN': PRACTICUM_TOKEN,
+              'TELEGRAM_CHAT_ID': TELEGRAM_CHAT_ID,
+              'TELEGRAM_TOKEN': TELEGRAM_TOKEN
+              }
+    counter = 0
     for token in tokens:
-        if token is None:
-            logger.critical(CHECK_TOKENS_ERROR)
-            raise ValueError(CHECK_TOKENS_ERROR)
+        if tokens[token] is None:
+            logger.critical(DETAIL_TOKEN_ERROR.format(token))
+            counter += 1
+    if counter > 0:
+        raise ValueError(GLOBAL_TOKENS_ERROR)
 
 
 def send_message(bot, message):
@@ -59,8 +71,9 @@ def send_message(bot, message):
         bot.send_message(TELEGRAM_CHAT_ID, message)
         logger.debug(SEND_MESSAGE_SUCCESS.format(message))
         return True
-    except Exception:
-        logger.exception(SEND_MESSAGE_ERROR.format(message))
+    except Exception as err:
+        logger.exception(SEND_MESSAGE_ERROR.format(message, err))
+    return False
 
 
 def get_api_answer(timestamp):
@@ -72,72 +85,61 @@ def get_api_answer(timestamp):
             headers=HEADERS,
             params=params
         )
-    except requests.RequestException:
-        raise ConnectionError(API_ERROR.format(ENDPOINT, HEADERS, params))
+    except requests.RequestException as err:
+        raise ConnectionError(
+            CONNECTION_ERROR.format(ENDPOINT, HEADERS, params, err)
+        )
+    json_response = response.json()
+    error_keys = ('code', 'error')
+    for key in error_keys:
+        if key in json_response.keys():
+            raise ServerAnswerException(
+                SERVER_FAILURE_ERROR.format(
+                    ENDPOINT,
+                    HEADERS,
+                    params,
+                    json_response[key]
+                )
+            )
     if response.status_code != HTTPStatus.OK:
-        if 'code' in response.json().keys():
-            raise requests.RequestException(
-                SERVER_ERROR.format(
-                    ENDPOINT,
-                    HEADERS,
-                    params,
-                    response.json().get('code'),
-                    response.status_code
-                )
-            )
-        elif 'error' in response.json().keys():
-            raise requests.RequestException(
-                SERVER_ERROR.format(
-                    ENDPOINT,
-                    HEADERS,
-                    params,
-                    response.json().get('error'),
-                    response.status_code
-                )
-            )
-        else:
-            raise requests.RequestException(
-                SERVER_ERROR.format(
-                    ENDPOINT,
-                    HEADERS,
-                    params,
-                    None,
-                    response.status_code
-                )
-            )
-    return response.json()
+        raise ServerAnswerException(
+            HTTP_ERROR.format(
+                ENDPOINT,
+                HEADERS,
+                params,
+                response.status_code))
+    return json_response
 
 
 def check_response(response):
     """Проверяем данные в ответе API."""
-    if type(response) is not dict:
-        raise TypeError(DATA_TYPE_ERROR.format(type(response)))
-    if issubclass(type(response), dict) is False:
+    if type(response) is not dict or issubclass(type(response), dict) is False:
         raise TypeError(DATA_TYPE_ERROR.format(type(response)))
     if 'homeworks' not in response.keys():
-        raise TypeError(NO_HOMEWORK_KEY_ERROR)
-    homeworks_data = response.get('homeworks')
-    if type(homeworks_data) is not list:
+        raise KeyError(NO_HOMEWORK_KEY_ERROR)
+    homeworks_data = response['homeworks']
+    if type(homeworks_data) is not list or issubclass(
+            type(homeworks_data), list) is False:
         raise TypeError(KEY_DATA_TYPE_ERROR.format(type(homeworks_data)))
-    if issubclass(type(homeworks_data), list) is False:
-        raise TypeError(KEY_DATA_TYPE_ERROR.format(type(homeworks_data)))
-    if len(homeworks_data) > 0:
-        return homeworks_data[0]
 
 
 def parse_status(homework):
     """Проверяем статус работы."""
+    try:
+        homework_status = homework['status']
+    except KeyError:
+        logger.debug('У домашки не обновился статус.')
     if 'homework_name' not in homework:
         raise KeyError(HOMEWORK_NAME_ERROR)
     if 'status' not in homework:
         raise KeyError(HOMEWORK_STATUS_ERROR)
-    if homework.get('status') not in HOMEWORK_VERDICTS.keys():
+    if homework_status not in HOMEWORK_VERDICTS.keys():
         raise ValueError(
             UNEXPECTED_HOMEWORK_STATUS.format(homework.get('status'))
         )
     return STATUS_CHANGE_MESSAGE.format(
         homework.get('homework_name'),
-        HOMEWORK_VERDICTS.get(homework.get('status'))
+        HOMEWORK_VERDICTS.get(homework_status)
     )
 
 
@@ -151,23 +153,19 @@ def main():
     while True:
         try:
             response = get_api_answer(timestamp)
-            timestamp = response.get('current_date')
-            homework = check_response(response)
-            if not homework:
-                logger.debug('Отсутствуют работы с новым статусом.')
-                continue
-            current_status = parse_status(homework)
-            if current_status != last_status:
-                if send_message(bot, current_status):
-                    last_status = current_status
-                    logger.debug('Статус работы изменился.')
+            check_response(response)
+            current_status = parse_status(response['homeworks'][0])
+            if current_status != last_status and send_message(
+                    bot, current_status) is True:
+                last_status = current_status
+                timestamp = response.get('current_date', timestamp)
+                logger.debug('Статус работы изменился.')
             last_error = None
         except Exception as error:
             message = f'Сбой в работе программы: {error}'
             logger.error(message)
-            if message != last_error:
-                if send_message(bot, message):
-                    last_error = message
+            if message != last_error and send_message(bot, message) is True:
+                last_error = message
         finally:
             time.sleep(RETRY_PERIOD)
 
@@ -177,6 +175,9 @@ if __name__ == '__main__':
         format='%(funcName)s - %(lineno)s - %(asctime)s - %(name)s - '
         '%(levelname)s - %(message)s',
         level=logging.DEBUG,
-        handlers=handlers
+        handlers=[
+            logging.StreamHandler(stream=sys.stdout),
+            logging.FileHandler(filename=__file__ + '.log', encoding='utf-8')
+        ]
     )
     main()
