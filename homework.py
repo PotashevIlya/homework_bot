@@ -13,7 +13,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 handlers = [
     logging.StreamHandler(),
-    logging.FileHandler(filename=__file__+'.log', encoding='utf-8')
+    logging.FileHandler(filename=__file__ + '.log', encoding='utf-8')
 ]
 
 PRACTICUM_TOKEN = os.getenv('PRACTICUM_TOKEN')
